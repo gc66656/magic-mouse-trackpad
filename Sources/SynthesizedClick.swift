@@ -15,7 +15,7 @@ enum SynthesizedClick {
 
     static let signature: Int64 = 0x4D43_4C4B  // "MCLK"
 
-    static func post(button: Button, at location: CGPoint? = nil) {
+    static func post(button: Button, at location: CGPoint? = nil, clickCount: Int64? = nil) {
         let loc: CGPoint
         if let location {
             loc = location
@@ -57,10 +57,14 @@ enum SynthesizedClick {
             MMTLog.log("[診断] SynthesizedClick: CGEventの生成失敗")
             return
         }
+        if let clickCount {
+            down.setIntegerValueField(.mouseEventClickState, value: clickCount)
+            up.setIntegerValueField(.mouseEventClickState, value: clickCount)
+        }
         down.setIntegerValueField(.eventSourceUserData, value: signature)
         down.post(tap: .cghidEventTap)
         up.setIntegerValueField(.eventSourceUserData, value: signature)
         up.post(tap: .cghidEventTap)
-        MMTLog.log("[診断] SynthesizedClick: post完了 \(button) loc=(\(Int(loc.x)),\(Int(loc.y)))")
+        MMTLog.log("[診断] SynthesizedClick: post完了 \(button) clickCount=\(clickCount ?? 1) loc=(\(Int(loc.x)),\(Int(loc.y)))")
     }
 }

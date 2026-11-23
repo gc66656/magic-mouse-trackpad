@@ -3,6 +3,7 @@ import Combine
 import CoreGraphics
 import Darwin
 import Foundation
+import QuartzCore
 
 /// 仮想トラックパッドモード。有効化中はマルチタッチのストロークをカーソル移動に変換し、
 /// タップをクリックとして合成する。プロトタイプ(prototypes/virtual_trackpad/main.swift)の
@@ -11,7 +12,7 @@ import Foundation
 /// 規律(手順書 magic-mouse-toolkit-仮想トラックパッド実装手順.md 準拠):
 /// MTコールバック(handleContactFrame)内では CGEvent 生成・メモリ確保・ログ出力を行わず、
 /// os_unfair_lock で保護したアキュムレータへの書き込みのみに留める。実際の CGEvent 生成/post は
-/// 専用シリアルキュー上の 120Hz タイマー(drainAndPost)でのみ行う。
+/// メインキュー上の 120Hz タイマー(drainAndPost)で行う。
 final class TrackpadModeController: ObservableObject {
     static let shared = TrackpadModeController()
 
@@ -24,9 +25,8 @@ final class TrackpadModeController: ObservableObject {
         }
     }
 
-    private let drainQueue = DispatchQueue(label: "com.mori0818.magicmousetoolkit.trackpadmode.drain")
     private var drainTimer: DispatchSourceTimer?
-    /// drainQueue専用。他スレッドから触らないこと
+    /// Main queue only.
     private lazy var moveEventSource = CGEventSource(stateID: .hidSystemState)
 
     // 全ディスプレイのbounds(CG座標・左上原点)。120Hzのdrainループから毎回
@@ -71,7 +71,35 @@ final class TrackpadModeController: ObservableObject {
     private var accLock = os_unfair_lock()
     private var accDX: Double = 0
     private var accDY: Double = 0
-    private var accClickPending = false
+    private var pendingClicks = 0
+    private var pendingDoubleClicks = 0
+    private var pendingRightClick = false
+    private var pendingDragDelta = CGPoint.zero
+    private var pendingDragRelease = false
+    private var acceptingTouches = false
+
+    // Main queue only. The event tap and touch output share the button state.
+    private var dragLocation: CGPoint?
+    private var nativeCursorDetached = false
+    private var pointerRemainder = CGPoint.zero
+    private var lastTap: (time: Double, position: CGPoint)?
+    private var mapGesture = MapGesture()
+    private var pendingMapKind: MapGesture.Kind?
+    private var pendingMapAmount = 0.0
+    private var pendingMapEnd = false
+    // Main queue only.
+    private var activeMapKind: MapGesture.Kind?
+    private var dragCandidate = false
+    private var dragging = false
+    private var dragMotionSource = DragMotionSource()
+    private var resumingAfterMultipleTouches = false
+    private let restingRadius = 0.008
+    private let tapMotionLimit = 0.06
+    private let dragStartDistance = 0.030
+    private let secondTouchHoldDelay: TimeInterval = 0.125
+    private let retouchRadius = 0.14
+    private var doubleTapInterval: TimeInterval = 0.30
+    private let modePreferenceKey = "mmt.trackpad.preferredActive"
     private var accTogglePending = false
 
     // 現在追跡中の指(1本のみ)。2本以上では追跡を中断し、スクロールに専念する。
@@ -79,11 +107,25 @@ final class TrackpadModeController: ObservableObject {
     private var lastTouchPos = MTPoint(x: 0, y: 0)
 
     // タップ判定用の追跡状態(タッチ開始時にリセット)
-    private var touchStartPos = MTPoint(x: 0, y: 0)
+    private var touchStartPos = CGPoint.zero
+    private var filteredTouchPos = CGPoint.zero
+    private var lastMotionTime: Double = 0
+    private var motionSpeed = 0.0
     private var touchStartTime: Double = 0
+    private var tapDisqualified = false
     private var touchPathLength: Double = 0
     private var touchMaxVelocity: Double = 0
     private var touchFrameCount: Int = 0
+
+    private struct TwoFingerTap {
+        let first: MTTouch
+        let second: MTTouch
+        let startedAt: Double
+        var frames = 0
+        var firstReleaseAt: Double?
+    }
+
+    private var twoFingerTap: TwoFingerTap?
 
     // モード解除用の3本指タップ追跡。MTコールバック内では数値状態だけを更新し、
     // 実際の切り替えは drainAndPost からメインキューへ渡す。
@@ -104,22 +146,31 @@ final class TrackpadModeController: ObservableObject {
             DispatchQueue.main.async { [weak self] in self?.toggle() }
             return
         }
-        if isActive {
-            deactivate()
-        } else {
+        UserDefaults.standard.set(!isActive, forKey: modePreferenceKey)
+        restorePreferredMode()
+    }
+
+    func restorePreferredMode() {
+        let preferred = UserDefaults.standard.object(forKey: modePreferenceKey) as? Bool ?? true
+        if preferred {
             activate()
+        } else {
+            deactivate()
         }
     }
 
     private func activate() {
-        guard !isActive else { return }
+        guard !isActive, AppSettings.shared.enabled, EventInterceptor.shared.isRunning else { return }
         isActive = true
-        resetTrackingState()
-
         os_unfair_lock_lock(&accLock)
+        resetTrackingState()
+        acceptingTouches = true
+        doubleTapInterval = min(NSEvent.doubleClickInterval, 0.30)
         accDX = 0
         accDY = 0
-        accClickPending = false
+        pendingClicks = 0
+        pendingDoubleClicks = 0
+        pendingRightClick = false
         accTogglePending = false
         os_unfair_lock_unlock(&accLock)
 
@@ -129,7 +180,7 @@ final class TrackpadModeController: ObservableObject {
         SharedState.shared.fingerCount = 0
         SharedState.shared.trackpadModeActive = true
 
-        let timer = DispatchSource.makeTimerSource(queue: drainQueue)
+        let timer = DispatchSource.makeTimerSource(queue: .main)
         timer.schedule(deadline: .now(), repeating: 1.0 / 120.0)
         timer.setEventHandler { [weak self] in self?.drainAndPost() }
         timer.resume()
@@ -139,16 +190,16 @@ final class TrackpadModeController: ObservableObject {
         TrackpadModeHUD.flash(active: true)
     }
 
-    private func deactivate() {
+    func deactivate() {
         guard isActive else { return }
         isActive = false
 
-        // trackpadModeActive を落とす前に追跡状態を先に畳んでおく。
-        // 先に落とすと、その瞬間に走っているMTコールバックが中途半端な
-        // trackedID/アキュムレータを読む余地が理論上生まれるため
         drainTimer?.cancel()
         drainTimer = nil
-        trackedID = nil
+        os_unfair_lock_lock(&accLock)
+        acceptingTouches = false
+        os_unfair_lock_unlock(&accLock)
+        cancelTouchSequence()
         SharedState.shared.trackpadScrollPassthrough = false
         SharedState.shared.trackpadMomentumEligibleUntil = -1e9
         SharedState.shared.trackpadScrollOwner = 0
@@ -159,10 +210,40 @@ final class TrackpadModeController: ObservableObject {
         TrackpadModeHUD.flash(active: false)
     }
 
+    func cancelTouchSequence() {
+        os_unfair_lock_lock(&accLock)
+        resetTrackingState()
+        accDX = 0
+        accDY = 0
+        pendingClicks = 0
+        pendingDoubleClicks = 0
+        pendingRightClick = false
+        pendingDragDelta = .zero
+        pendingDragRelease = false
+        accTogglePending = false
+        os_unfair_lock_unlock(&accLock)
+
+        postMapGesture(kind: nil, amount: 0, ended: true)
+        releaseDrag()
+        setNativeCursorDetached(false)
+        pointerRemainder = .zero
+    }
+
     private func resetTrackingState() {
+        twoFingerTap = nil
+        mapGesture = MapGesture()
+        pendingMapKind = nil
+        pendingMapAmount = 0
+        pendingMapEnd = false
+        SharedState.shared.trackpadAllowsDirectScroll = false
+        lastTap = nil
+        dragCandidate = false
+        dragging = false
+        dragMotionSource = DragMotionSource()
+        resumingAfterMultipleTouches = false
         trackedID = nil
         lastTouchPos = MTPoint(x: 0, y: 0)
-        touchStartPos = MTPoint(x: 0, y: 0)
+        touchStartPos = .zero
         touchStartTime = 0
         touchPathLength = 0
         touchMaxVelocity = 0
@@ -183,28 +264,82 @@ final class TrackpadModeController: ObservableObject {
 
     /// MTコールバック経由(TouchGestureManager)から呼ばれる。CGEvent生成・ログ出力禁止。
     func handleContactFrame(touches: UnsafeBufferPointer<MTTouch>, timestamp: Double, settings: SettingsSnapshot) {
+        os_unfair_lock_lock(&accLock)
+        defer { os_unfair_lock_unlock(&accLock) }
+        guard acceptingTouches else { return }
+
         // モード中は TouchGestureManager が早期returnするため、指本数と時刻をここで共有する。
         var touchingCount = 0
-        var firstTouch: MTTouch?
-        var positionSumX: Float = 0
-        var positionSumY: Float = 0
-        var maxVelocity: Double = 0
-        for touch in touches where touch.state == 4 {
+        var firstIndex: Int?
+        var secondIndex: Int?
+        var trackedIndex: Int?
+        for index in touches.indices where touches[index].state == 4 {
             touchingCount += 1
-            if firstTouch == nil { firstTouch = touch }
-            positionSumX += touch.normalized.position.x
-            positionSumY += touch.normalized.position.y
-            let velocity = touch.normalized.velocity
-            let magnitude = (Double(velocity.x) * Double(velocity.x)
-                + Double(velocity.y) * Double(velocity.y)).squareRoot()
-            maxVelocity = max(maxVelocity, magnitude)
+            if touchingCount == 1 { firstIndex = index }
+            if touchingCount == 2 { secondIndex = index }
+            if touches[index].identifier == trackedID { trackedIndex = index }
         }
         SharedState.shared.fingerCount = touchingCount
         SharedState.shared.lastFrameAt = timestamp
 
+        if dragging {
+            switch dragMotionSource.acceptTouch(at: timestamp) {
+            case .ignore:
+                // Optical ownership needs only the original finger's contact state.
+                if trackedIndex == nil {
+                    evaluateTapAndReset(endTime: timestamp, settings: settings)
+                    resumingAfterMultipleTouches = touchingCount > 0
+                }
+                return
+            case .rebase:
+                if touchingCount == 1, let trackedIndex {
+                    let contact = touches[trackedIndex].normalized.position
+                    lastTouchPos = contact
+                    filteredTouchPos = CGPoint(x: Double(contact.x), y: Double(contact.y))
+                    lastMotionTime = timestamp
+                    motionSpeed = 0
+                    pendingDragDelta = .zero
+                    return
+                }
+            case .move:
+                break
+            }
+        }
+
+        let firstTouch = firstIndex.map { touches[$0] }
+        let secondTouch = secondIndex.map { touches[$0] }
+        if touchingCount == 2, let firstTouch, let secondTouch {
+            let delta = mapGesture.update(firstTouch, secondTouch)
+            SharedState.shared.trackpadAllowsDirectScroll = mapGesture.kind == .scroll
+            if let kind = mapGesture.kind {
+                twoFingerTap = nil
+                if kind != .scroll {
+                    pendingMapKind = kind
+                    pendingMapAmount += delta
+                }
+            }
+        } else {
+            if let kind = mapGesture.kind, kind != .scroll {
+                pendingMapEnd = true
+            }
+            mapGesture = MapGesture()
+            SharedState.shared.trackpadAllowsDirectScroll = false
+        }
+
+        if touchingCount >= 3 { twoFingerTap = nil }
+
         if touchingCount >= 3,
            settings.threeFingerTapEnabled,
            settings.threeFingerTapAction.isTrackpadToggle {
+            var positionSumX: Float = 0
+            var positionSumY: Float = 0
+            var maxVelocity = 0.0
+            for touch in touches where touch.state == 4 {
+                positionSumX += touch.normalized.position.x
+                positionSumY += touch.normalized.position.y
+                let velocity = touch.normalized.velocity
+                maxVelocity = max(maxVelocity, hypot(Double(velocity.x), Double(velocity.y)))
+            }
             let centroid = MTPoint(
                 x: positionSumX / Float(touchingCount),
                 y: positionSumY / Float(touchingCount))
@@ -225,11 +360,7 @@ final class TrackpadModeController: ObservableObject {
                 threeFingerFrameCount = 1
             }
 
-            trackedID = nil
-            os_unfair_lock_lock(&accLock)
-            accDX = 0
-            accDY = 0
-            os_unfair_lock_unlock(&accLock)
+            interruptSingleFingerGesture()
             return
         }
 
@@ -246,12 +377,11 @@ final class TrackpadModeController: ObservableObject {
                     && threeFingerMaxVelocity <= settings.tapMaxVelocity
                     && threeFingerFrameCount >= settings.tapMinFrames
                 resetThreeFingerTracking()
+                resumingAfterMultipleTouches = false
                 if isTap {
                     if timestamp - lastThreeFingerToggleTapAt <= trackpadToggleDoubleTapWindow {
                         lastThreeFingerToggleTapAt = -1e9
-                        os_unfair_lock_lock(&accLock)
                         accTogglePending = true
-                        os_unfair_lock_unlock(&accLock)
                     } else {
                         lastThreeFingerToggleTapAt = timestamp
                     }
@@ -262,27 +392,46 @@ final class TrackpadModeController: ObservableObject {
             return
         }
 
+        let waitingForSecondRelease = touchingCount <= 2 && mapGesture.kind == nil && updateTwoFingerTap(
+            first: firstTouch, second: secondTouch,
+            at: timestamp, settings: settings
+        )
+
         // 2本以上ではカーソル・タップ追跡を中断し、未ドレインの移動量も破棄する。
         if touchingCount >= 2 {
-            trackedID = nil
-            os_unfair_lock_lock(&accLock)
-            accDX = 0
-            accDY = 0
-            os_unfair_lock_unlock(&accLock)
+            interruptSingleFingerGesture()
             return
         }
+
+        if waitingForSecondRelease { return }
 
         guard let touch = firstTouch else {
-            evaluateTapAndReset(endPos: lastTouchPos, endTime: timestamp, settings: settings)
+            resumingAfterMultipleTouches = false
+            evaluateTapAndReset(endTime: timestamp, settings: settings)
             return
         }
 
+        let position = CGPoint(x: Double(touch.normalized.position.x), y: Double(touch.normalized.position.y))
         if trackedID != touch.identifier {
+            if trackedID != nil {
+                interruptSingleFingerGesture()
+                return
+            }
+            dragCandidate = !resumingAfterMultipleTouches && (lastTap.map {
+                timestamp - $0.time <= doubleTapInterval
+                    && hypot(position.x - $0.position.x, position.y - $0.position.y) <= retouchRadius
+            } ?? false)
+            lastTap = nil
+            dragMotionSource = DragMotionSource()
             // 新規タッチ開始。デルタ0で基準位置だけ記録(いきなり跳ばないように)
             trackedID = touch.identifier
             lastTouchPos = touch.normalized.position
-            touchStartPos = touch.normalized.position
+            touchStartPos = position
+            filteredTouchPos = position
+            lastMotionTime = timestamp
+            motionSpeed = 0
             touchStartTime = timestamp
+            tapDisqualified = resumingAfterMultipleTouches
             touchPathLength = 0
             touchMaxVelocity = 0
             touchFrameCount = 0
@@ -291,10 +440,6 @@ final class TrackpadModeController: ObservableObject {
 
         let ndx = Double(touch.normalized.position.x - lastTouchPos.x)
         let ndy = Double(touch.normalized.position.y - lastTouchPos.y)
-        let rawDX = ndx * settings.trackpadModeGain
-        // MTの正規化Yは前方(指を伸ばす先端側)が大きい。画面は上原点でYが下に増えるため、
-        // 「前方へなぞる=カーソルが上へ動く」という直感に合わせて符号反転する(プロトタイプStep2確認済み)
-        let rawDY = -ndy * settings.trackpadModeGain
         lastTouchPos = touch.normalized.position
 
         touchPathLength += (ndx * ndx + ndy * ndy).squareRoot()
@@ -303,70 +448,323 @@ final class TrackpadModeController: ObservableObject {
         touchMaxVelocity = max(touchMaxVelocity, velocityMagnitude)
         touchFrameCount += 1
 
+        let dx = position.x - touchStartPos.x
+        let dy = position.y - touchStartPos.y
+        let displacement = hypot(dx, dy)
+        if displacement > tapMotionLimit {
+            tapDisqualified = true
+        }
+
+        if dragCandidate && !dragging {
+            guard displacement >= dragStartDistance else { return }
+            dragging = true
+            // Keep the pointer at the click location until the finger clears the dead zone.
+            let fraction = max(0, dragStartDistance - restingRadius) / displacement
+            filteredTouchPos = CGPoint(
+                x: touchStartPos.x + dx * fraction,
+                y: touchStartPos.y + dy * fraction
+            )
+            lastMotionTime = timestamp
+        }
+
+        let delta = pointerDelta(to: position, at: timestamp, gain: settings.trackpadModeGain)
+        if dragging {
+            if delta != .zero { dragMotionSource.recordTouchMotion(at: timestamp) }
+            pendingDragDelta.x += delta.x
+            pendingDragDelta.y += delta.y
+        } else {
+            accDX += delta.x
+            accDY += delta.y
+        }
+    }
+
+    /// During the held gesture, consume native movement and route relative optical
+    /// deltas through the same drag output as touch. Native cursor coordinates are
+    /// never forwarded while a synthetic drag is active.
+    func consumeOpticalMotion(_ delta: CGPoint, at time: Double) -> Bool {
         os_unfair_lock_lock(&accLock)
-        accDX += rawDX
-        accDY += rawDY
-        os_unfair_lock_unlock(&accLock)
+        defer { os_unfair_lock_unlock(&accLock) }
+        guard acceptingTouches else { return false }
+        if pendingDragRelease { return true }
+        guard trackedID != nil, dragCandidate else { return false }
+
+        switch dragMotionSource.acceptOptical(delta, at: time, duringDrag: dragging) {
+        case .ignore:
+            break
+        case .begin(let initialTravel):
+            dragging = true
+            pendingDragDelta = initialTravel
+            filteredTouchPos = CGPoint(x: Double(lastTouchPos.x), y: Double(lastTouchPos.y))
+            lastMotionTime = time
+            motionSpeed = 0
+        case .continueMoving:
+            pendingDragDelta.x += delta.x
+            pendingDragDelta.y += delta.y
+        }
+        return true
+    }
+
+    /// A short, nearly stationary touch must include both fingers and end with both lifted.
+    private func updateTwoFingerTap(
+        first: MTTouch?, second: MTTouch?, at time: Double, settings: SettingsSnapshot
+    ) -> Bool {
+        let shared = SharedState.shared
+        guard settings.twoFingerTapEnabled, !shared.buttonDown else {
+            twoFingerTap = nil
+            return false
+        }
+        if twoFingerTap == nil, let first, let second, !resumingAfterMultipleTouches, !dragging {
+            let startTime = trackedID == nil ? time : touchStartTime
+            if time - startTime <= settings.twoFingerSyncWindow,
+               trackedID == nil || touchPathLength <= 0.025 {
+                twoFingerTap = TwoFingerTap(first: first, second: second, startedAt: startTime)
+            }
+        }
+        guard var tap = twoFingerTap else { return false }
+        let releaseWindow = min(settings.twoFingerSyncWindow, 0.09)
+        guard time - tap.startedAt <= settings.tapMaxDuration,
+              shared.lastButtonUpAt < tap.startedAt,
+              time - (tap.firstReleaseAt ?? time) <= releaseWindow else {
+            twoFingerTap = nil
+            return false
+        }
+        guard let first else {
+            if tap.frames >= settings.tapMinFrames { pendingRightClick = true }
+            twoFingerTap = nil
+            return false
+        }
+
+        let motionLimit = min(settings.tapMaxStraightDistance, 0.035)
+        func stayedNearStart(_ touch: MTTouch) -> Bool {
+            let start = touch.identifier == tap.first.identifier ? tap.first : tap.second
+            guard start.identifier == touch.identifier else { return false }
+            let dx = Double(touch.normalized.position.x - start.normalized.position.x)
+            let dy = Double(touch.normalized.position.y - start.normalized.position.y)
+            return hypot(dx, dy) <= motionLimit
+        }
+        guard stayedNearStart(first),
+              second.map({ tap.firstReleaseAt == nil && stayedNearStart($0) }) ?? true else {
+            twoFingerTap = nil
+            return false
+        }
+        if second != nil {
+            tap.frames += 1
+        } else if tap.firstReleaseAt == nil {
+            tap.firstReleaseAt = time
+        }
+        twoFingerTap = tap
+        return second == nil
+    }
+
+    private func pointerDelta(to position: CGPoint, at timestamp: Double, gain: Double) -> CGPoint {
+        let elapsed = max(0.004, timestamp - lastMotionTime)
+        lastMotionTime = timestamp
+        let dx = position.x - filteredTouchPos.x
+        let dy = position.y - filteredTouchPos.y
+        let distance = hypot(dx, dy)
+        let travel = max(0, distance - restingRadius)
+        // A time-based speed estimate keeps the response consistent across frame rates.
+        motionSpeed += (travel / elapsed - motionSpeed) * (1 - exp(-elapsed / 0.026))
+        guard travel > 0 else { return .zero }
+
+        let fraction = travel / distance
+        let filteredDX = dx * fraction
+        let filteredDY = dy * fraction
+        filteredTouchPos.x += filteredDX
+        filteredTouchPos.y += filteredDY
+
+        let speedFraction = min(1, max(0, (motionSpeed - 0.18) / 2.6))
+        let ramp = speedFraction * speedFraction * (3 - 2 * speedFraction)
+        let multiplier = dragging ? 0.58 + 0.80 * ramp : 0.45 + 1.85 * ramp
+        return CGPoint(x: filteredDX * gain * multiplier, y: -filteredDY * gain * multiplier)
+    }
+
+    private func interruptSingleFingerGesture() {
+        trackedID = nil
+        lastTap = nil
+        dragCandidate = false
+        resumingAfterMultipleTouches = true
+        accDX = 0
+        accDY = 0
+        if dragging {
+            dragging = false
+            pendingDragRelease = true
+        }
     }
 
     /// タッチ終了(リリース)時にタップかどうかを判定し、成立していればクリックフラグを立てる。
     /// CGEventの生成はここでは行わない(MTコールバックの規律)。
-    private func evaluateTapAndReset(endPos: MTPoint, endTime: Double, settings: SettingsSnapshot) {
+    private func evaluateTapAndReset(endTime: Double, settings: SettingsSnapshot) {
         guard trackedID != nil else { return }
         trackedID = nil
+        defer { dragCandidate = false }
+        if dragging {
+            dragging = false
+            pendingDragRelease = true
+            return
+        }
 
-        let dx = Double(endPos.x - touchStartPos.x)
-        let dy = Double(endPos.y - touchStartPos.y)
-        let straightDistance = (dx * dx + dy * dy).squareRoot()
+        let dx = Double(lastTouchPos.x) - touchStartPos.x
+        let dy = Double(lastTouchPos.y) - touchStartPos.y
         let duration = endTime - touchStartTime
 
-        let isTap = duration <= settings.tapMaxDuration
-            && straightDistance <= settings.tapMaxStraightDistance
-            && touchPathLength <= settings.tapMaxPathLength
+        let minimumFrames = dragCandidate ? max(1, settings.tapMinFrames - 1) : settings.tapMinFrames
+        let isTap = !tapDisqualified && duration <= settings.tapMaxDuration
+            && hypot(dx, dy) <= min(settings.tapMaxStraightDistance, tapMotionLimit)
+            && touchPathLength <= min(settings.tapMaxPathLength, 0.10)
             && touchMaxVelocity <= settings.tapMaxVelocity
-            && touchFrameCount >= settings.tapMinFrames
+            && touchFrameCount >= minimumFrames
 
-        if isTap {
-            os_unfair_lock_lock(&accLock)
-            accClickPending = true
-            os_unfair_lock_unlock(&accLock)
+        guard isTap else { return }
+        if dragCandidate {
+            pendingDoubleClicks += 1
+        } else {
+            pendingClicks += 1
+            if touchPathLength <= 0.035 {
+                lastTap = (endTime, touchStartPos)
+            }
         }
     }
 
-    /// 専用キューのタイマーがアキュムレータをドレインし、mouseMoved / クリックを post する(120Hz)。
+    /// Quartz can move the cursor before an event tap discards the movement event.
+    /// Detach it from hardware while touch owns the drag and restore it on release or handoff.
+    private func setNativeCursorDetached(_ detached: Bool) {
+        guard detached != nativeCursorDetached else { return }
+        let result = CGAssociateMouseAndMouseCursorPosition(detached ? 0 : 1)
+        if result == .success {
+            nativeCursorDetached = detached
+        }
+    }
+
+    private func postMouseEvent(_ type: CGEventType, at location: CGPoint) -> Bool {
+        guard let event = CGEvent(
+            mouseEventSource: moveEventSource,
+            mouseType: type,
+            mouseCursorPosition: location,
+            mouseButton: .left
+        ) else { return false }
+        event.setIntegerValueField(.eventSourceUserData, value: SynthesizedClick.signature)
+        if type != .mouseMoved {
+            event.setIntegerValueField(.mouseEventClickState, value: 1)
+        }
+        if type == .leftMouseDragged, let dragLocation {
+            event.setDoubleValueField(.mouseEventDeltaX, value: location.x - dragLocation.x)
+            event.setDoubleValueField(.mouseEventDeltaY, value: location.y - dragLocation.y)
+        }
+        if nativeCursorDetached, type == .leftMouseDragged, location != dragLocation {
+            // A detached cursor needs a position update in addition to the app's drag event.
+            _ = CGWarpMouseCursorPosition(location)
+        }
+        event.post(tap: .cghidEventTap)
+        return true
+    }
+
+    private func releaseDrag() {
+        guard let dragLocation else { return }
+        _ = postMouseEvent(.leftMouseUp, at: dragLocation)
+        self.dragLocation = nil
+    }
+
+    private func postMapGesture(kind: MapGesture.Kind?, amount: Double, ended: Bool) {
+        guard kind != nil || activeMapKind != nil,
+              let point = CGEvent(source: nil)?.location else { return }
+        if let kind {
+            if activeMapKind == nil {
+                MapGestureEvent.make(kind, .began, amount: 0, at: point)?.post(tap: .cghidEventTap)
+                activeMapKind = kind
+                MMTLog.log(kind == .magnify ? "双指捏合缩放开始" : "双指旋转开始")
+            }
+            if amount != 0 {
+                let value = kind == .magnify ? exp(amount) - 1 : amount
+                MapGestureEvent.make(kind, .changed, amount: value, at: point)?.post(tap: .cghidEventTap)
+            }
+        }
+        if ended, let activeMapKind {
+            MapGestureEvent.make(activeMapKind, .ended, amount: 0, at: point)?.post(tap: .cghidEventTap)
+            self.activeMapKind = nil
+        }
+    }
+
+    /// Called with accLock held. A stationary second touch can hold even when
+    /// the sensor has not delivered another contact frame.
+    private func beginStationaryHold(at time: Double) -> Bool {
+        guard acceptingTouches, trackedID != nil, dragCandidate, !dragging,
+              time - touchStartTime >= secondTouchHoldDelay else { return false }
+        dragging = true
+        filteredTouchPos = CGPoint(x: Double(lastTouchPos.x), y: Double(lastTouchPos.y))
+        lastMotionTime = time
+        motionSpeed = 0
+        return true
+    }
+
+    /// The hardware callback only accumulates input. Post events in order on the output queue.
     private func drainAndPost() {
+        let now = CACurrentMediaTime()
         os_unfair_lock_lock(&accLock)
-        let dx = accDX
-        let dy = accDY
-        let clickPending = accClickPending
+        let delta = CGPoint(x: accDX, y: accDY)
+        let clicks = pendingClicks
+        let doubleClicks = pendingDoubleClicks
+        let rightClick = pendingRightClick
+        let mapKind = pendingMapKind
+        let mapAmount = pendingMapAmount
+        let endMap = pendingMapEnd
+        pendingMapKind = nil
+        pendingMapAmount = 0
+        pendingMapEnd = false
+        let dragDelta = pendingDragDelta
+        let beginHold = beginStationaryHold(at: now)
+        let endDrag = pendingDragRelease
+        let detachNativeCursor = dragging && dragMotionSource.isTouchDriving(at: now)
         let togglePending = accTogglePending
         accDX = 0
         accDY = 0
-        accClickPending = false
+        pendingClicks = 0
+        pendingDoubleClicks = 0
+        pendingRightClick = false
+        pendingDragDelta = .zero
+        pendingDragRelease = false
         accTogglePending = false
         os_unfair_lock_unlock(&accLock)
 
-        if dx != 0 || dy != 0 {
-            if let current = CGEvent(source: nil)?.location {
-                let target = CGPoint(x: current.x + dx, y: current.y + dy)
-                let resolved = resolvedPosition(current: current, target: target)
+        setNativeCursorDetached(detachNativeCursor)
 
-                if let src = moveEventSource,
-                   let move = CGEvent(
-                        mouseEventSource: src,
-                        mouseType: .mouseMoved,
-                        mouseCursorPosition: resolved,
-                        mouseButton: .left
-                   ) {
-                    move.setIntegerValueField(.eventSourceUserData, value: SynthesizedClick.signature)
-                    move.post(tap: .cghidEventTap)
+        if delta != .zero, let current = CGEvent(source: nil)?.location {
+            // Carry fractional motion across timer ticks so very slow strokes still move.
+            let x = delta.x + pointerRemainder.x
+            let y = delta.y + pointerRemainder.y
+            let step = CGPoint(x: x.rounded(), y: y.rounded())
+            pointerRemainder = CGPoint(x: x - step.x, y: y - step.y)
+            if step != .zero {
+                let target = CGPoint(x: current.x + step.x, y: current.y + step.y)
+                _ = postMouseEvent(.mouseMoved, at: resolvedPosition(current: current, target: target))
+            }
+        }
+
+        for _ in 0..<clicks {
+            SynthesizedClick.post(button: .left, clickCount: 1)
+        }
+
+        // The first tap was posted with click count 1. Complete the sequence on the second release.
+        for _ in 0..<doubleClicks {
+            SynthesizedClick.post(button: .left, clickCount: 2)
+        }
+
+        if (beginHold || dragDelta != .zero), let current = dragLocation ?? CGEvent(source: nil)?.location {
+            if dragLocation == nil, postMouseEvent(.leftMouseDown, at: current) {
+                dragLocation = current
+            }
+            if dragLocation != nil, dragDelta != .zero {
+                let target = CGPoint(x: current.x + dragDelta.x, y: current.y + dragDelta.y)
+                let position = resolvedPosition(current: current, target: target)
+                if postMouseEvent(.leftMouseDragged, at: position) {
+                    dragLocation = position
                 }
             }
         }
 
-        if clickPending {
-            SynthesizedClick.post(button: .left)
-        }
+        if endDrag { releaseDrag() }
+        if rightClick { SynthesizedClick.post(button: .right) }
+        postMapGesture(kind: mapKind, amount: mapAmount, ended: endMap)
 
         if togglePending {
             DispatchQueue.main.async { [weak self] in self?.toggle() }

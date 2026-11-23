@@ -54,6 +54,10 @@ final class EventInterceptor {
             | (1 << CGEventType.rightMouseDown.rawValue)
             | (1 << CGEventType.rightMouseUp.rawValue)
             | (1 << CGEventType.scrollWheel.rawValue)
+            | (1 << CGEventType.mouseMoved.rawValue)
+            | (1 << CGEventType.leftMouseDragged.rawValue)
+            | (1 << 29) // Quartz gesture envelope
+            | (1 << 32) // Smart magnify
 
         guard let tap = CGEvent.tapCreate(
             tap: .cghidEventTap,
@@ -122,11 +126,26 @@ final class EventInterceptor {
         guard let tap = eventTap else { return }
         let enabled = AppSettings.shared.enabled
         if !enabled {
+            TrackpadModeController.shared.deactivate()
             // OFF 中は mouseUp を取りこぼすため、変換途中・押下中の状態を必ずクリアする
             clearSharedInputState()
         }
         CGEvent.tapEnable(tap: tap, enable: enabled)
+        if enabled {
+            TrackpadModeController.shared.restorePreferredMode()
+        }
         MMTLog.log("イベントタップ: \(enabled ? "有効化" : "無効化")")
+    }
+
+    private func scaleScroll(
+        _ event: CGEvent, by gain: Double, delta: CGEventField, points: CGEventField, fixed: CGEventField
+    ) {
+        let raw = event.getIntegerValueField(delta)
+        let pixels = event.getIntegerValueField(points)
+        let precise = event.getDoubleValueField(fixed)
+        event.setIntegerValueField(delta, value: Int64((Double(raw) * gain).rounded()))
+        event.setIntegerValueField(points, value: Int64((Double(pixels) * gain).rounded()))
+        event.setDoubleValueField(fixed, value: precise * gain)
     }
 
     fileprivate func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
@@ -152,12 +171,35 @@ final class EventInterceptor {
         let shared = SharedState.shared
         let now = CACurrentMediaTime()
 
+        if shared.trackpadModeActive, now - shared.lastFrameAt < 0.5,
+           now - shared.builtInTrackpadLastFrameAt >= 0.5 {
+            // The Magic Mouse's native one-finger double tap conflicts with drag arming.
+            let isSmartMagnify = type.rawValue == 32
+                || (type.rawValue == 29 && CGEventField(rawValue: 110).map {
+                    event.getIntegerValueField($0) == 22
+                } == true)
+            if isSmartMagnify { return nil }
+        }
+
         switch type {
+        case .mouseMoved, .leftMouseDragged:
+            guard shared.trackpadModeActive, !shared.buttonDown,
+                  event.getIntegerValueField(.eventSourceUserData) != SynthesizedClick.signature,
+                  !(shared.builtInTrackpadFingerCount > 0 && now - shared.builtInTrackpadLastFrameAt < 0.08) else {
+                return Unmanaged.passUnretained(event)
+            }
+            let delta = CGPoint(x: event.getDoubleValueField(.mouseEventDeltaX),
+                                y: event.getDoubleValueField(.mouseEventDeltaY))
+            if TrackpadModeController.shared.consumeOpticalMotion(delta, at: now) { return nil }
+            return Unmanaged.passUnretained(event)
+
         case .scrollWheel:
             if shared.trackpadModeActive {
                 // 直近フレームで2本指を確認できたスクロールと、その慣性列だけを通す。
-                // デルタ値には触れず、macOSが生成した高精度の減速カーブをそのまま維持する。
-                let magicMouseTwoFingers = shared.fingerCount >= 2 && (now - shared.lastFrameAt) < 0.08
+                // Preserve native timing and inertia, scaling only Magic Mouse deltas.
+                let mouseContacts = shared.fingerCount
+                let mouseScrollAllowed = shared.trackpadAllowsDirectScroll
+                let magicMouseTwoFingers = mouseContacts == 2 && mouseScrollAllowed && (now - shared.lastFrameAt) < 0.08
                 let builtInTwoFingers = shared.builtInTrackpadFingerCount >= 2
                     && (now - shared.builtInTrackpadLastFrameAt) < 0.08
                 // 両方が同時なら内蔵トラックパッドを優先する。
@@ -171,6 +213,11 @@ final class EventInterceptor {
                 let mayStartMomentum = now <= shared.trackpadMomentumEligibleUntil
                 let currentOwner = shared.trackpadScrollOwner
 
+                if mouseContacts >= 2 && !mouseScrollAllowed && !builtInTwoFingers && currentOwner != 2,
+                   !endsScroll && !endsMomentum {
+                    return nil
+                }
+
                 if endsMomentum && passthroughActive {
                     // CGMomentumScrollPhase の終端値は3。終端イベント自体を通してから閉じる。
                     shared.trackpadScrollPassthrough = false
@@ -182,6 +229,11 @@ final class EventInterceptor {
                     shared.trackpadMomentumEligibleUntil = now + 0.12
                     if currentOwner == 0 { shared.trackpadScrollOwner = detectedOwner }
                 } else if detectedOwner != 0 {
+                    if detectedOwner == 1, (!passthroughActive || currentOwner != 1),
+                       scrollPhase == 2, !inMomentum {
+                        // The native .began may have arrived before intent was established.
+                        event.setIntegerValueField(.scrollWheelEventScrollPhase, value: 1)
+                    }
                     shared.trackpadScrollPassthrough = true
                     shared.trackpadMomentumEligibleUntil = -1e9
                     shared.trackpadScrollOwner = detectedOwner
@@ -195,6 +247,18 @@ final class EventInterceptor {
                     shared.trackpadMomentumEligibleUntil = -1e9
                     shared.trackpadScrollOwner = 0
                     return nil
+                }
+
+                let owner = detectedOwner != 0 ? detectedOwner : currentOwner
+                if owner == 1 {
+                    scaleScroll(event, by: 1.35,
+                                delta: .scrollWheelEventDeltaAxis1,
+                                points: .scrollWheelEventPointDeltaAxis1,
+                                fixed: .scrollWheelEventFixedPtDeltaAxis1)
+                    scaleScroll(event, by: 1.50,
+                                delta: .scrollWheelEventDeltaAxis2,
+                                points: .scrollWheelEventPointDeltaAxis2,
+                                fixed: .scrollWheelEventFixedPtDeltaAxis2)
                 }
             }
 

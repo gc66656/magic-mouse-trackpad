@@ -29,6 +29,7 @@ final class SharedState {
     private var _convertingToMiddle: Bool = false
     private var _accessibilityGranted: Bool = false
     private var _trackpadModeActive: Bool = false
+    private var _trackpadAllowsDirectScroll = false
     private var _trackpadScrollPassthrough: Bool = false
     private var _trackpadMomentumEligibleUntil: CFTimeInterval = -1e9
     private var _trackpadScrollOwner: Int = 0
@@ -88,6 +89,11 @@ final class SharedState {
         get { withLock { _trackpadModeActive } }
         set { withLock { _trackpadModeActive = newValue } }
     }
+    var trackpadAllowsDirectScroll: Bool {
+        get { withLock { _trackpadAllowsDirectScroll } }
+        set { withLock { _trackpadAllowsDirectScroll = newValue } }
+    }
+
     /// トラックパッドモード中の2本指スクロールが進行中（慣性を含む）。
     var trackpadScrollPassthrough: Bool {
         get { withLock { _trackpadScrollPassthrough } }

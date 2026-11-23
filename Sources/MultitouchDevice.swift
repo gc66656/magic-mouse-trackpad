@@ -156,6 +156,7 @@ final class MultitouchDeviceManager {
             // start() での CFRetain と対。停止処理の後に自前スレッドで最終解放する
             Unmanaged<AnyObject>.fromOpaque(device).release()
         }
+        TrackpadModeController.shared.cancelTouchSequence()
         SharedState.shared.builtInTrackpadFingerCount = 0
         SharedState.shared.builtInTrackpadLastFrameAt = -1e9
         MMTLog.log("タッチ監視停止: \(devices.count)台を解放")

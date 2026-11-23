@@ -3,19 +3,19 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleIdentifier</key>
-	<string>com.mori0818.magicmousetoolkit</string>
+	<string>org.magicmousetrackpad.app</string>
 	<key>CFBundleName</key>
-	<string>Magic Mouse Toolkit</string>
+	<string>Magic Mouse Trackpad</string>
 	<key>CFBundleDisplayName</key>
-	<string>Magic Mouse Toolkit</string>
+	<string>Magic Mouse Trackpad</string>
 	<key>CFBundleExecutable</key>
 	<string>MagicMouseToolkit</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleVersion</key>
-	<string>1.0</string>
+	<string>1.18</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0</string>
+	<string>1.18</string>
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSHighResolutionCapable</key>
@@ -23,11 +23,11 @@
 	<key>LSMinimumSystemVersion</key>
 	<string>26.0</string>
 	<key>CFBundleDevelopmentRegion</key>
-	<string>ja</string>
+	<string>en</string>
 	<key>CFBundleLocalizations</key>
 	<array>
-		<string>ja</string>
 		<string>en</string>
+		<string>zh-Hans</string>
 	</array>
 </dict>
 </plist>

@@ -355,3 +355,6 @@
 
 /* マクロ録画中の件数表示 */
 "録画中… %dイベント" = "Recording… %d events";
+
+"双指轻点触发右键" = "Two-finger tap for right click";
+"Magic Mouse Trackpad" = "Magic Mouse Trackpad";
