@@ -355,3 +355,5 @@
 
 /* マクロ録画中の件数表示 */
 "録画中… %dイベント" = "Recording… %d events";
+
+"2本指タップで右クリック" = "Two-finger tap for right-click";

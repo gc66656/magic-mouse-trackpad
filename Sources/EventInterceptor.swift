@@ -54,6 +54,10 @@ final class EventInterceptor {
             | (1 << CGEventType.rightMouseDown.rawValue)
             | (1 << CGEventType.rightMouseUp.rawValue)
             | (1 << CGEventType.scrollWheel.rawValue)
+            | (1 << CGEventType.mouseMoved.rawValue)
+            | (1 << CGEventType.leftMouseDragged.rawValue)
+            | (1 << 29) // Quartz gesture envelope
+            | (1 << 32) // Smart magnify
 
         guard let tap = CGEvent.tapCreate(
             tap: .cghidEventTap,
@@ -104,7 +108,6 @@ final class EventInterceptor {
         shared.momentumActive = false
         shared.trackpadScrollPassthrough = false
         shared.trackpadMomentumEligibleUntil = -1e9
-        shared.trackpadScrollOwner = 0
     }
 
     @objc private func settingsChanged() {
@@ -122,10 +125,14 @@ final class EventInterceptor {
         guard let tap = eventTap else { return }
         let enabled = AppSettings.shared.enabled
         if !enabled {
+            TrackpadModeController.shared.deactivate()
             // OFF 中は mouseUp を取りこぼすため、変換途中・押下中の状態を必ずクリアする
             clearSharedInputState()
         }
         CGEvent.tapEnable(tap: tap, enable: enabled)
+        if enabled {
+            TrackpadModeController.shared.restorePreferredMode()
+        }
         MMTLog.log("イベントタップ: \(enabled ? "有効化" : "無効化")")
     }
 
@@ -152,48 +159,57 @@ final class EventInterceptor {
         let shared = SharedState.shared
         let now = CACurrentMediaTime()
 
-        switch type {
-        case .scrollWheel:
-            if shared.trackpadModeActive {
-                // 直近フレームで2本指を確認できたスクロールと、その慣性列だけを通す。
-                // デルタ値には触れず、macOSが生成した高精度の減速カーブをそのまま維持する。
-                let magicMouseTwoFingers = shared.fingerCount >= 2 && (now - shared.lastFrameAt) < 0.08
-                let builtInTwoFingers = shared.builtInTrackpadFingerCount >= 2
-                    && (now - shared.builtInTrackpadLastFrameAt) < 0.08
-                // 両方が同時なら内蔵トラックパッドを優先する。
-                let detectedOwner = builtInTwoFingers ? 2 : (magicMouseTwoFingers ? 1 : 0)
-                let scrollPhase = event.getIntegerValueField(.scrollWheelEventScrollPhase)
-                let momentumPhase = event.getIntegerValueField(.scrollWheelEventMomentumPhase)
-                let inMomentum = (momentumPhase == 1 || momentumPhase == 2)  // began / continued
-                let endsScroll = (scrollPhase == 4 || scrollPhase == 8)  // ended / cancelled
-                let endsMomentum = (momentumPhase == 3)
-                let passthroughActive = shared.trackpadScrollPassthrough
-                let mayStartMomentum = now <= shared.trackpadMomentumEligibleUntil
-                let currentOwner = shared.trackpadScrollOwner
+        if shared.trackpadModeActive, now - shared.lastFrameAt < 0.5,
+           now - shared.builtInTrackpadLastFrameAt >= 0.5 {
+            // The Magic Mouse's native one-finger double tap conflicts with drag arming.
+            let isSmartMagnify = type.rawValue == 32
+                || (type.rawValue == 29 && CGEventField(rawValue: 110).map {
+                    event.getIntegerValueField($0) == 22
+                } == true)
+            if isSmartMagnify { return nil }
+        }
 
-                if endsMomentum && passthroughActive {
-                    // CGMomentumScrollPhase の終端値は3。終端イベント自体を通してから閉じる。
+        switch type {
+        case .mouseMoved, .leftMouseDragged:
+            if type == .leftMouseDragged, shared.convertingToMiddle {
+                event.type = .otherMouseDragged
+                event.setIntegerValueField(.mouseEventButtonNumber, value: 2)
+                return Unmanaged.passUnretained(event)
+            }
+            guard shared.trackpadModeActive, !shared.buttonDown,
+                  event.getIntegerValueField(.eventSourceUserData) != SynthesizedClick.signature,
+                  !(shared.builtInTrackpadFingerCount > 0 && now - shared.builtInTrackpadLastFrameAt < 0.08) else {
+                return Unmanaged.passUnretained(event)
+            }
+            let delta = CGPoint(x: event.getDoubleValueField(.mouseEventDeltaX),
+                                y: event.getDoubleValueField(.mouseEventDeltaY))
+            if TrackpadModeController.shared.consumeOpticalMotion(delta, at: now) { return nil }
+            return Unmanaged.passUnretained(event)
+
+        case .scrollWheel:
+            if event.getIntegerValueField(.eventSourceUserData) == TouchScrollOutput.signature {
+                return Unmanaged.passUnretained(event)
+            }
+            if shared.trackpadModeActive {
+                // Magic Mouse scrolling comes from contact frames. Only the built-in
+                // trackpad's native sequence and its momentum pass through this path.
+                let builtIn = shared.builtInTrackpadFingerCount >= 2
+                    && now - shared.builtInTrackpadLastFrameAt < 0.08
+                let scrollPhase = event.getIntegerValueField(.scrollWheelEventScrollPhase)
+                let momentum = event.getIntegerValueField(.scrollWheelEventMomentumPhase)
+                let active = shared.trackpadScrollPassthrough
+                if momentum == 3, active {
                     shared.trackpadScrollPassthrough = false
                     shared.trackpadMomentumEligibleUntil = -1e9
-                    shared.trackpadScrollOwner = 0
-                } else if endsScroll && (passthroughActive || detectedOwner != 0) {
-                    // 直接操作の終端イベントを通し、直後の慣性開始だけを短時間受け入れる。
+                } else if scrollPhase == 4 || scrollPhase == 8 {
+                    guard active || builtIn else { return nil }
                     shared.trackpadScrollPassthrough = false
                     shared.trackpadMomentumEligibleUntil = now + 0.12
-                    if currentOwner == 0 { shared.trackpadScrollOwner = detectedOwner }
-                } else if detectedOwner != 0 {
+                } else if builtIn || (momentum == 1 || momentum == 2)
+                            && (active || now <= shared.trackpadMomentumEligibleUntil) {
                     shared.trackpadScrollPassthrough = true
                     shared.trackpadMomentumEligibleUntil = -1e9
-                    shared.trackpadScrollOwner = detectedOwner
-                } else if inMomentum && (passthroughActive || mayStartMomentum) && currentOwner != 0 {
-                    shared.trackpadScrollPassthrough = true
-                    shared.trackpadMomentumEligibleUntil = -1e9
-                } else if passthroughActive {
-                    // MTフレームとscrollWheelの配送順が前後しても、開始済みの列は欠落させない。
-                } else {
-                    shared.trackpadScrollPassthrough = false
-                    shared.trackpadMomentumEligibleUntil = -1e9
-                    shared.trackpadScrollOwner = 0
+                } else if !active || shared.fingerCount > 0 {
                     return nil
                 }
             }

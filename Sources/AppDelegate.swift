@@ -98,6 +98,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         MMTLog.log("終了")
+        TrackpadModeController.shared.deactivate()
         MacroRecorder.shared.stop()
         PermissionMonitor.stop()
         EventInterceptor.shared.stop()
@@ -134,6 +135,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// タップを即座に破棄し(CFMachPortInvalidate含む)、権限復帰を待つ状態に戻る。
     private func handleAccessibilityRevoked() {
         MMTLog.log("アクセシビリティ権限の喪失を検知。タップを破棄します")
+        TrackpadModeController.shared.deactivate()
         SharedState.shared.accessibilityGranted = false
         EventInterceptor.shared.stop()
     }
@@ -142,9 +144,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         MMTLog.log("スリープ準備: タッチ監視を停止")
         // トラックパッドモードを有効にしたままスリープすると、復帰後にMTデバイスが
         // 再初期化される一方でモードのフラグだけが残り、カーソルが操作不能になる
-        if TrackpadModeController.shared.isActive {
-            TrackpadModeController.shared.toggle()
-        }
+        TrackpadModeController.shared.deactivate()
         MultitouchDeviceManager.shared.stop()
     }
 
@@ -152,6 +152,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         MMTLog.log("スリープ復帰")
         MultitouchDeviceManager.shared.restart()
         PointerSpeedManager.shared.reapply()
+        TrackpadModeController.shared.restorePreferredMode()
     }
 
     // MARK: - メニューバー
@@ -200,6 +201,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
+        let trackpadItem = NSMenuItem(
+            title: NSLocalizedString("トラックパッドモード", comment: "Virtual trackpad menu toggle"),
+            action: #selector(toggleTrackpadMode), keyEquivalent: "")
+        trackpadItem.target = self
+        trackpadItem.state = TrackpadModeController.shared.isActive ? .on : .off
+        menu.addItem(trackpadItem)
+
         let openSettingsItem = NSMenuItem(title: NSLocalizedString("設定を開く…", comment: "メニューバー項目"), action: #selector(openSettings), keyEquivalent: ",")
         openSettingsItem.target = self
         menu.addItem(openSettingsItem)
@@ -229,6 +237,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         MMTLog.log("有効切り替え: \(AppSettings.shared.enabled)")
     }
 
+    @objc private func toggleTrackpadMode() {
+        TrackpadModeController.shared.toggle()
+    }
+
     @objc private func rediscoverDevices() {
         MultitouchDeviceManager.shared.restart()
     }
@@ -248,7 +260,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // Liquid Glass ウィンドウ（フェーズ2）
             let window = GlassWindow.make(
                 rootView: SettingsView(),
-                title: "Magic Mouse Toolkit",
+                title: NSLocalizedString("Magic Mouse Toolkit", comment: "Settings window title"),
                 contentSize: DS.Layout.windowSize
             )
             window.delegate = self
@@ -265,9 +277,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+extension AppDelegate: NSMenuItemValidation {
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(toggleTrackpadMode) {
+            return AppSettings.shared.enabled && EventInterceptor.shared.isRunning
+        }
+        return true
+    }
+}
+
 extension AppDelegate: NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
-        let trusted = AXIsProcessTrusted()
+        let trusted = EventInterceptor.shared.isRunning
+        if let item = menu.items.first(where: { $0.action == #selector(toggleTrackpadMode) }) {
+            item.state = TrackpadModeController.shared.isActive ? .on : .off
+        }
         permissionStatusItem?.title = trusted
             ? NSLocalizedString("権限: 許可済み ✓", comment: "メニューバー: 権限ステータス")
             : NSLocalizedString("権限: 未許可 ✗（クリックが送出できません）", comment: "メニューバー: 権限ステータス")

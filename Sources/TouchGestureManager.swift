@@ -31,7 +31,6 @@ final class SharedState {
     private var _trackpadModeActive: Bool = false
     private var _trackpadScrollPassthrough: Bool = false
     private var _trackpadMomentumEligibleUntil: CFTimeInterval = -1e9
-    private var _trackpadScrollOwner: Int = 0
     private var _builtInTrackpadFingerCount: Int = 0
     private var _builtInTrackpadLastFrameAt: CFTimeInterval = -1e9
 
@@ -88,6 +87,7 @@ final class SharedState {
         get { withLock { _trackpadModeActive } }
         set { withLock { _trackpadModeActive = newValue } }
     }
+
     /// トラックパッドモード中の2本指スクロールが進行中（慣性を含む）。
     var trackpadScrollPassthrough: Bool {
         get { withLock { _trackpadScrollPassthrough } }
@@ -97,11 +97,6 @@ final class SharedState {
     var trackpadMomentumEligibleUntil: CFTimeInterval {
         get { withLock { _trackpadMomentumEligibleUntil } }
         set { withLock { _trackpadMomentumEligibleUntil = newValue } }
-    }
-    /// 0=なし、1=Magic Mouse、2=MacBook内蔵トラックパッド。
-    var trackpadScrollOwner: Int {
-        get { withLock { _trackpadScrollOwner } }
-        set { withLock { _trackpadScrollOwner = newValue } }
     }
     var builtInTrackpadFingerCount: Int {
         get { withLock { _builtInTrackpadFingerCount } }

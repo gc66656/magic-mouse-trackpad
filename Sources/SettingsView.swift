@@ -184,7 +184,11 @@ struct SettingsView: View {
                 .notifyOnChange(of: oneFingerTapEnabled)
             toggleRow(NSLocalizedString("タップは常に左クリック(右クリックは物理クリックのみ)", comment: "メイン設定トグル"), isOn: $tapAlwaysLeftClick)
                 .notifyOnChange(of: tapAlwaysLeftClick)
-            toggleRow(NSLocalizedString("2本指タップで左クリック", comment: "メイン設定トグル"), isOn: $twoFingerTapEnabled)
+            toggleRow(
+                NSLocalizedString(trackpadMode.isActive ? "2本指タップで右クリック" : "2本指タップで左クリック",
+                                  comment: "Two-finger tap action"),
+                isOn: $twoFingerTapEnabled
+            )
                 .notifyOnChange(of: twoFingerTapEnabled)
             toggleRow(NSLocalizedString("2本指クリックでミドルクリック", comment: "メイン設定トグル"), isOn: $middleClickEnabled)
                 .notifyOnChange(of: middleClickEnabled)

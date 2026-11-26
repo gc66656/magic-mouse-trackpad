@@ -3,7 +3,7 @@
 Magic Mouse Toolkit is an open-source macOS utility that adds configurable gestures
 and a virtual trackpad mode to Apple Magic Mouse.
 
-The UI supports Japanese and English (follows the system's `AppleLanguages` setting).
+The UI supports Japanese, English, and Simplified Chinese (follows the system's `AppleLanguages` setting).
 
 ## Features
 
@@ -12,7 +12,9 @@ The UI supports Japanese and English (follows the system's `AppleLanguages` sett
 - Middle click via two-finger physical click
 - Play back a recorded keyboard macro with a three-finger tap
 - Virtual trackpad mode: stroke the Magic Mouse surface with one finger
-- Two-finger scrolling and native inertia while in virtual trackpad mode
+- Continuous two-finger horizontal and vertical scrolling with inertia in virtual trackpad mode
+- Two-finger pinch and rotation in compatible apps
+- In Trackpad Mode, tap once, then touch again and slide to drag. Lift the finger to release.
 - Toggle modes with a three-finger double tap
 - Input isolation from the MacBook's built-in trackpad
 - Magic Mouse battery level display
