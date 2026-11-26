@@ -20,7 +20,7 @@ Requires macOS 26 or later and an Apple Magic Mouse. The download is a universal
 | Tap twice, lifting both times | Double-click |
 | Tap, touch again, and hold | Hold left click. Slide your finger or move the mouse body to drag. Lift to release. |
 | Tap with two fingers | Right-click |
-| Slide two fingers together | Scroll, with native inertia |
+| Slide two fingers together | Continuous horizontal and vertical scrolling with inertia |
 | Pinch, spread, or turn two fingers | Zoom or rotate in supported apps |
 
 During a touch-driven drag, the app detaches the hardware pointer from the cursor until touch movement stops or the drag is released. This prevents the mouse body from interrupting finger-based positioning. Two-finger gestures lock to one action for the duration of the gesture. Zoom and rotation use private macOS gesture fields, so support can vary by app or macOS version.

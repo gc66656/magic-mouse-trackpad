@@ -108,7 +108,6 @@ final class EventInterceptor {
         shared.momentumActive = false
         shared.trackpadScrollPassthrough = false
         shared.trackpadMomentumEligibleUntil = -1e9
-        shared.trackpadScrollOwner = 0
     }
 
     @objc private func settingsChanged() {
@@ -135,17 +134,6 @@ final class EventInterceptor {
             TrackpadModeController.shared.restorePreferredMode()
         }
         MMTLog.log("イベントタップ: \(enabled ? "有効化" : "無効化")")
-    }
-
-    private func scaleScroll(
-        _ event: CGEvent, by gain: Double, delta: CGEventField, points: CGEventField, fixed: CGEventField
-    ) {
-        let raw = event.getIntegerValueField(delta)
-        let pixels = event.getIntegerValueField(points)
-        let precise = event.getDoubleValueField(fixed)
-        event.setIntegerValueField(delta, value: Int64((Double(raw) * gain).rounded()))
-        event.setIntegerValueField(points, value: Int64((Double(pixels) * gain).rounded()))
-        event.setDoubleValueField(fixed, value: precise * gain)
     }
 
     fileprivate func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
@@ -183,6 +171,11 @@ final class EventInterceptor {
 
         switch type {
         case .mouseMoved, .leftMouseDragged:
+            if type == .leftMouseDragged, shared.convertingToMiddle {
+                event.type = .otherMouseDragged
+                event.setIntegerValueField(.mouseEventButtonNumber, value: 2)
+                return Unmanaged.passUnretained(event)
+            }
             guard shared.trackpadModeActive, !shared.buttonDown,
                   event.getIntegerValueField(.eventSourceUserData) != SynthesizedClick.signature,
                   !(shared.builtInTrackpadFingerCount > 0 && now - shared.builtInTrackpadLastFrameAt < 0.08) else {
@@ -194,71 +187,30 @@ final class EventInterceptor {
             return Unmanaged.passUnretained(event)
 
         case .scrollWheel:
+            if event.getIntegerValueField(.eventSourceUserData) == TouchScrollOutput.signature {
+                return Unmanaged.passUnretained(event)
+            }
             if shared.trackpadModeActive {
-                // 直近フレームで2本指を確認できたスクロールと、その慣性列だけを通す。
-                // Preserve native timing and inertia, scaling only Magic Mouse deltas.
-                let mouseContacts = shared.fingerCount
-                let mouseScrollAllowed = shared.trackpadAllowsDirectScroll
-                let magicMouseTwoFingers = mouseContacts == 2 && mouseScrollAllowed && (now - shared.lastFrameAt) < 0.08
-                let builtInTwoFingers = shared.builtInTrackpadFingerCount >= 2
-                    && (now - shared.builtInTrackpadLastFrameAt) < 0.08
-                // 両方が同時なら内蔵トラックパッドを優先する。
-                let detectedOwner = builtInTwoFingers ? 2 : (magicMouseTwoFingers ? 1 : 0)
+                // Magic Mouse scrolling comes from contact frames. Only the built-in
+                // trackpad's native sequence and its momentum pass through this path.
+                let builtIn = shared.builtInTrackpadFingerCount >= 2
+                    && now - shared.builtInTrackpadLastFrameAt < 0.08
                 let scrollPhase = event.getIntegerValueField(.scrollWheelEventScrollPhase)
-                let momentumPhase = event.getIntegerValueField(.scrollWheelEventMomentumPhase)
-                let inMomentum = (momentumPhase == 1 || momentumPhase == 2)  // began / continued
-                let endsScroll = (scrollPhase == 4 || scrollPhase == 8)  // ended / cancelled
-                let endsMomentum = (momentumPhase == 3)
-                let passthroughActive = shared.trackpadScrollPassthrough
-                let mayStartMomentum = now <= shared.trackpadMomentumEligibleUntil
-                let currentOwner = shared.trackpadScrollOwner
-
-                if mouseContacts >= 2 && !mouseScrollAllowed && !builtInTwoFingers && currentOwner != 2,
-                   !endsScroll && !endsMomentum {
-                    return nil
-                }
-
-                if endsMomentum && passthroughActive {
-                    // CGMomentumScrollPhase の終端値は3。終端イベント自体を通してから閉じる。
+                let momentum = event.getIntegerValueField(.scrollWheelEventMomentumPhase)
+                let active = shared.trackpadScrollPassthrough
+                if momentum == 3, active {
                     shared.trackpadScrollPassthrough = false
                     shared.trackpadMomentumEligibleUntil = -1e9
-                    shared.trackpadScrollOwner = 0
-                } else if endsScroll && (passthroughActive || detectedOwner != 0) {
-                    // 直接操作の終端イベントを通し、直後の慣性開始だけを短時間受け入れる。
+                } else if scrollPhase == 4 || scrollPhase == 8 {
+                    guard active || builtIn else { return nil }
                     shared.trackpadScrollPassthrough = false
                     shared.trackpadMomentumEligibleUntil = now + 0.12
-                    if currentOwner == 0 { shared.trackpadScrollOwner = detectedOwner }
-                } else if detectedOwner != 0 {
-                    if detectedOwner == 1, (!passthroughActive || currentOwner != 1),
-                       scrollPhase == 2, !inMomentum {
-                        // The native .began may have arrived before intent was established.
-                        event.setIntegerValueField(.scrollWheelEventScrollPhase, value: 1)
-                    }
+                } else if builtIn || (momentum == 1 || momentum == 2)
+                            && (active || now <= shared.trackpadMomentumEligibleUntil) {
                     shared.trackpadScrollPassthrough = true
                     shared.trackpadMomentumEligibleUntil = -1e9
-                    shared.trackpadScrollOwner = detectedOwner
-                } else if inMomentum && (passthroughActive || mayStartMomentum) && currentOwner != 0 {
-                    shared.trackpadScrollPassthrough = true
-                    shared.trackpadMomentumEligibleUntil = -1e9
-                } else if passthroughActive {
-                    // MTフレームとscrollWheelの配送順が前後しても、開始済みの列は欠落させない。
-                } else {
-                    shared.trackpadScrollPassthrough = false
-                    shared.trackpadMomentumEligibleUntil = -1e9
-                    shared.trackpadScrollOwner = 0
+                } else if !active || shared.fingerCount > 0 {
                     return nil
-                }
-
-                let owner = detectedOwner != 0 ? detectedOwner : currentOwner
-                if owner == 1 {
-                    scaleScroll(event, by: 1.35,
-                                delta: .scrollWheelEventDeltaAxis1,
-                                points: .scrollWheelEventPointDeltaAxis1,
-                                fixed: .scrollWheelEventFixedPtDeltaAxis1)
-                    scaleScroll(event, by: 1.50,
-                                delta: .scrollWheelEventDeltaAxis2,
-                                points: .scrollWheelEventPointDeltaAxis2,
-                                fixed: .scrollWheelEventFixedPtDeltaAxis2)
                 }
             }
 

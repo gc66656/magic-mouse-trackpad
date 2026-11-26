@@ -84,6 +84,11 @@ final class TrackpadModeController: ObservableObject {
     private var pointerRemainder = CGPoint.zero
     private var lastTap: (time: Double, position: CGPoint)?
     private var mapGesture = MapGesture()
+    private var pendingScroll = CGPoint.zero
+    private var scrollContactDeadline: Double?
+    private let scrollContactGrace: Double = 0.035
+    private var touchScroll = TouchScrollOutput()
+    private var naturalScrolling = true
     private var pendingMapKind: MapGesture.Kind?
     private var pendingMapAmount = 0.0
     private var pendingMapEnd = false
@@ -162,6 +167,7 @@ final class TrackpadModeController: ObservableObject {
     private func activate() {
         guard !isActive, AppSettings.shared.enabled, EventInterceptor.shared.isRunning else { return }
         isActive = true
+        naturalScrolling = UserDefaults.standard.object(forKey: "com.apple.swipescrolldirection") as? Bool ?? true
         os_unfair_lock_lock(&accLock)
         resetTrackingState()
         acceptingTouches = true
@@ -176,7 +182,6 @@ final class TrackpadModeController: ObservableObject {
 
         SharedState.shared.trackpadScrollPassthrough = false
         SharedState.shared.trackpadMomentumEligibleUntil = -1e9
-        SharedState.shared.trackpadScrollOwner = 0
         SharedState.shared.fingerCount = 0
         SharedState.shared.trackpadModeActive = true
 
@@ -202,7 +207,6 @@ final class TrackpadModeController: ObservableObject {
         cancelTouchSequence()
         SharedState.shared.trackpadScrollPassthrough = false
         SharedState.shared.trackpadMomentumEligibleUntil = -1e9
-        SharedState.shared.trackpadScrollOwner = 0
         SharedState.shared.fingerCount = 0
         SharedState.shared.trackpadModeActive = false
 
@@ -223,6 +227,7 @@ final class TrackpadModeController: ObservableObject {
         accTogglePending = false
         os_unfair_lock_unlock(&accLock)
 
+        touchScroll.cancel()
         postMapGesture(kind: nil, amount: 0, ended: true)
         releaseDrag()
         setNativeCursorDetached(false)
@@ -235,7 +240,8 @@ final class TrackpadModeController: ObservableObject {
         pendingMapKind = nil
         pendingMapAmount = 0
         pendingMapEnd = false
-        SharedState.shared.trackpadAllowsDirectScroll = false
+        pendingScroll = .zero
+        scrollContactDeadline = nil
         lastTap = nil
         dragCandidate = false
         dragging = false
@@ -308,9 +314,18 @@ final class TrackpadModeController: ObservableObject {
 
         let firstTouch = firstIndex.map { touches[$0] }
         let secondTouch = secondIndex.map { touches[$0] }
-        if touchingCount == 2, let firstTouch, let secondTouch {
-            let delta = mapGesture.update(firstTouch, secondTouch)
-            SharedState.shared.trackpadAllowsDirectScroll = mapGesture.kind == .scroll
+        if let deadline = scrollContactDeadline, timestamp >= deadline {
+            endTwoFingerMotion()
+        }
+        if touchingCount == 2, let firstTouch, let secondTouch, !threeFingerTracking {
+            if !mapGesture.tracks(firstTouch, secondTouch) {
+                endTwoFingerMotion()
+            }
+            let rebaseScroll = scrollContactDeadline != nil
+            scrollContactDeadline = nil
+            let delta = mapGesture.update(firstTouch, secondTouch, rebaseScroll: rebaseScroll)
+            pendingScroll.x += mapGesture.scrollDelta.x
+            pendingScroll.y += mapGesture.scrollDelta.y
             if let kind = mapGesture.kind {
                 twoFingerTap = nil
                 if kind != .scroll {
@@ -318,12 +333,14 @@ final class TrackpadModeController: ObservableObject {
                     pendingMapAmount += delta
                 }
             }
-        } else {
-            if let kind = mapGesture.kind, kind != .scroll {
-                pendingMapEnd = true
+        } else if touchingCount == 1, let firstTouch, mapGesture.kind == .scroll,
+                  mapGesture.tracks(firstTouch) {
+            if scrollContactDeadline == nil {
+                scrollContactDeadline = timestamp + scrollContactGrace
             }
-            mapGesture = MapGesture()
-            SharedState.shared.trackpadAllowsDirectScroll = false
+            return
+        } else {
+            endTwoFingerMotion()
         }
 
         if touchingCount >= 3 { twoFingerTap = nil }
@@ -411,6 +428,9 @@ final class TrackpadModeController: ObservableObject {
             return
         }
 
+        // A remaining finger belongs to the multi-finger gesture until every finger lifts.
+        guard !resumingAfterMultipleTouches else { return }
+
         let position = CGPoint(x: Double(touch.normalized.position.x), y: Double(touch.normalized.position.y))
         if trackedID != touch.identifier {
             if trackedID != nil {
@@ -467,6 +487,8 @@ final class TrackpadModeController: ObservableObject {
             lastMotionTime = timestamp
         }
 
+        // Give the second finger a short landing window before moving the pointer.
+        guard dragging || timestamp - touchStartTime >= 0.025 else { return }
         let delta = pointerDelta(to: position, at: timestamp, gain: settings.trackpadModeGain)
         if dragging {
             if delta != .zero { dragMotionSource.recordTouchMotion(at: timestamp) }
@@ -476,6 +498,14 @@ final class TrackpadModeController: ObservableObject {
             accDX += delta.x
             accDY += delta.y
         }
+    }
+
+    private func endTwoFingerMotion() {
+        if let kind = mapGesture.kind, kind != .scroll {
+            pendingMapEnd = true
+        }
+        mapGesture = MapGesture()
+        scrollContactDeadline = nil
     }
 
     /// During the held gesture, consume native movement and route relative optical
@@ -711,6 +741,13 @@ final class TrackpadModeController: ObservableObject {
         pendingMapKind = nil
         pendingMapAmount = 0
         pendingMapEnd = false
+        if let deadline = scrollContactDeadline, now >= deadline {
+            endTwoFingerMotion()
+        }
+        let scroll = pendingScroll
+        pendingScroll = .zero
+        let scrolling = mapGesture.kind == .scroll
+        let touching = SharedState.shared.fingerCount >= 2 || trackedID != nil
         let dragDelta = pendingDragDelta
         let beginHold = beginStationaryHold(at: now)
         let endDrag = pendingDragRelease
@@ -764,6 +801,9 @@ final class TrackpadModeController: ObservableObject {
 
         if endDrag { releaseDrag() }
         if rightClick { SynthesizedClick.post(button: .right) }
+        let direction = naturalScrolling ? 1.0 : -1.0
+        touchScroll.update(CGPoint(x: scroll.x * 900 * direction, y: -scroll.y * 810 * direction),
+                           scrolling: scrolling, touching: touching, now: now)
         postMapGesture(kind: mapKind, amount: mapAmount, ended: endMap)
 
         if togglePending {
