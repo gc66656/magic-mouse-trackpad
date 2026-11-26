@@ -4,6 +4,14 @@
 
 Use an Apple Magic Mouse as a small trackpad. Leave the mouse on your desk and use its touch surface to move the pointer, scroll, zoom, rotate, and drag.
 
+## What sets Magic Mouse Trackpad apart
+
+The upstream project already provides a virtual trackpad mode with pointer movement and two-finger scrolling. Magic Mouse Trackpad adds tap-to-drag and reworks how touch input feels on the mouse surface. [Magic Mouse Toolkit by mori0818](https://github.com/mori0818/magic-mouse-toolkit)
+
+- **Two-finger scrolling and canvas panning.** Swipe to produce continuous horizontal and vertical scrolling with inertia, without pressing the mouse or pausing first. Compatible design apps can use the same input to pan the canvas.
+- **One-finger tap-to-drag.** Tap once, touch down again, then slide to drag. Lift your finger to release. You can select text or drag an object while the mouse stays on the desk.
+- **Touch input tuned for the mouse surface.** Pointer movement adapts to how fast you slide. Scrolling filters small jitters, accumulates slow movement, and can continue if one finger briefly drops out of the touch reports.
+
 ## Install
 
 1. Download `Magic-Mouse-Trackpad-1.19-macOS.zip` from [Release v1.19](https://github.com/gc66656/magic-mouse-trackpad/releases/tag/v1.19) and extract it.
