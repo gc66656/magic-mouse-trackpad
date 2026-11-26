@@ -8,6 +8,10 @@ Use an Apple Magic Mouse as a small trackpad. Leave the mouse on your desk and u
 
 **Left:** Slide two fingers together to pan in a compatible design app. **Right:** Tap once, lift, then touch again and slide to drag. Lift to release.
 
+**Two-finger right-click.** Tap lightly with both fingers together, then lift to open the context menu.
+
+![Animation of a two-finger tap opening a right-click menu.](docs/media/two-finger-right-click.gif)
+
 ## What sets Magic Mouse Trackpad apart
 
 The upstream project already moves the pointer from touch input and passes through the Magic Mouse’s native scroll events during a two-finger gesture. Magic Mouse Trackpad builds on this with explicit single-finger double-click recognition, tap-to-drag, and continuous two-axis scrolling generated directly from the touch positions. Compatible design apps can use those two axes to pan freely, including diagonally. [Magic Mouse Toolkit by mori0818](https://github.com/mori0818/magic-mouse-toolkit)
