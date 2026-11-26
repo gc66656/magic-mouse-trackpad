@@ -1,12 +1,12 @@
 # Magic Mouse Trackpad
 
-[简体中文](README.zh-CN.md) · [v1.18 Downloads](https://github.com/gc66656/magic-mouse-trackpad/releases/tag/v1.18)
+[简体中文](README.zh-CN.md) · [v1.19 Downloads](https://github.com/gc66656/magic-mouse-trackpad/releases/tag/v1.19)
 
 Use an Apple Magic Mouse as a small trackpad. Leave the mouse on your desk and use its touch surface to move the pointer, scroll, zoom, rotate, and drag.
 
 ## Install
 
-1. Download `Magic-Mouse-Trackpad-1.18-macOS.zip` from [Release v1.18](https://github.com/gc66656/magic-mouse-trackpad/releases/tag/v1.18) and extract it.
+1. Download `Magic-Mouse-Trackpad-1.19-macOS.zip` from [Release v1.19](https://github.com/gc66656/magic-mouse-trackpad/releases/tag/v1.19) and extract it.
 2. Move **Magic Mouse Trackpad.app** to Applications and open it. This community build is ad-hoc signed and is not Apple-notarized. If macOS blocks it, review the download and use **System Settings → Privacy & Security → Open Anyway**, or build it from source.
 3. Enable the app in **System Settings → Privacy & Security → Accessibility**. Trackpad Mode starts automatically after permission is available and can be toggled from the menu bar.
 

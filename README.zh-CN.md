@@ -1,12 +1,12 @@
 # 妙控鼠标触控板
 
-[English](README.md) · [下载 1.18](https://github.com/gc66656/magic-mouse-trackpad/releases/tag/v1.18)
+[English](README.md) · [下载 1.19](https://github.com/gc66656/magic-mouse-trackpad/releases/tag/v1.19)
 
 把苹果妙控鼠标当作一块小触控板。鼠标可以留在桌面原地，用表面触控移动光标、滚动、缩放、旋转和拖拽。
 
 ## 安装
 
-1. 从 [1.18 发布页](https://github.com/gc66656/magic-mouse-trackpad/releases/tag/v1.18) 下载 `Magic-Mouse-Trackpad-1.18-macOS.zip` 并解压。
+1. 从 [1.19 发布页](https://github.com/gc66656/magic-mouse-trackpad/releases/tag/v1.19) 下载 `Magic-Mouse-Trackpad-1.19-macOS.zip` 并解压。
 2. 将 **Magic Mouse Trackpad.app** 移到「应用程序」并打开。公开下载使用临时签名，未经过 Apple 公证。如果 macOS 拦截，请确认下载来源后到「系统设置 → 隐私与安全性」选择「仍要打开」，也可以自行从源码构建。
 3. 在「系统设置 → 隐私与安全性 → 辅助功能」授权。授权后默认开启触控板模式，可从菜单栏切换。
 
